@@ -1,0 +1,376 @@
+"""
+QBO Seasonal Forecasting Assistant
+-----------------------------------
+Projects P&L and Cash Flow out to year-end using a "seasonal naive + growth"
+method:
+
+  1. Pull monthly actuals for the prior year (Jan-Dec) and current year
+     (Jan-through-last-closed-month) for both ProfitAndLoss and CashFlow.
+  2. For each line item, compute a YoY growth factor from the overlapping
+     months (this year's YTD actual vs. the same months last year).
+  3. For each remaining month of the current year, forecast = last year's
+     value for that month x growth factor. This preserves whatever monthly
+     seasonality existed last year (e.g. a Q4 sales spike) while scaling the
+     whole shape up or down based on how this year is actually trending.
+
+This is a standard, explainable forecasting approach for CFO-style reporting.
+It is NOT a statistical/ML model - it assumes this year's seasonal pattern
+resembles last year's. For accounts with no prior-year history, growth
+defaults to 1.0 (flat carry-forward of the current run-rate).
+"""
+
+import os
+import re
+from pathlib import Path
+from datetime import date
+
+import numpy as np
+import pandas as pd
+import requests
+from requests.auth import HTTPBasicAuth
+from dotenv import load_dotenv
+import plotly.graph_objects as go
+import plotly.express as px
+
+# ---------------------------------------------------------------------------
+# Config / Auth (mirrors the pattern from qbo_pl_fluctuation.py)
+# ---------------------------------------------------------------------------
+env_path = Path(__file__).parent / "API_Keys.env"
+load_dotenv(env_path, override=True)
+
+BASE_URL = "https://sandbox-quickbooks.api.intuit.com"
+REALM_ID = os.getenv("Realm_ID")
+CLIENT_ID = os.getenv("Client_ID")
+CLIENT_SECRET = os.getenv("Client_Secret")
+REFRESH_TOKEN = os.getenv("Refresh_Token")
+
+CURRENT_YEAR = date.today().year
+PRIOR_YEAR = CURRENT_YEAR - 1
+# Forecast from the first day of the current year through the last day of
+# the most recently *completed* month (QBO monthly reports are cleanest on
+# closed-month boundaries; adjust if you want partial current-month actuals).
+today = date.today()
+if today.day == 1:
+    last_actual_month = today.month - 1 or 12
+else:
+    last_actual_month = today.month - 1 if today.month > 1 else 12
+LAST_ACTUAL_MONTH = max(last_actual_month, 1)
+
+
+def get_new_access_token():
+    url = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
+    headers = {"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"}
+    payload = {"grant_type": "refresh_token", "refresh_token": REFRESH_TOKEN}
+    try:
+        response = requests.post(url, headers=headers, data=payload,
+                                  auth=HTTPBasicAuth(CLIENT_ID, CLIENT_SECRET))
+        if response.status_code == 200:
+            token_data = response.json()
+            return token_data["access_token"]
+        print(f"Failed to refresh token: {response.text}")
+        return None
+    except Exception as e:
+        print(f"Token refresh connection error: {e}")
+        return None
+
+
+ACCESS_TOKEN = get_new_access_token() or os.getenv("Access_Token")
+HEADERS = {
+    "Authorization": f"Bearer {ACCESS_TOKEN}",
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+}
+
+MONTH_ORDER = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+# ---------------------------------------------------------------------------
+# Fetch + parse helpers
+# ---------------------------------------------------------------------------
+def fetch_monthly_report(report_name: str, start_date: str, end_date: str) -> dict:
+    """report_name: 'ProfitAndLoss' or 'CashFlow'"""
+    url = f"{BASE_URL}/v3/company/{REALM_ID}/reports/{report_name}"
+    params = {
+        "start_date": start_date,
+        "end_date": end_date,
+        "accounting_method": "Accrual",
+        "summarize_column_by": "Month",
+        "minorversion": "75",
+    }
+    response = requests.get(url, headers=HEADERS, params=params)
+    response.raise_for_status()
+    return response.json()
+
+
+def parse_monthly_report(report_json: dict) -> pd.DataFrame:
+    """
+    Flattens a QBO monthly-summarized report into long format:
+    Line_Item, Category, Month (e.g. 'Jan'), Year, Value, Is_Summary
+    Skips the trailing 'Total' column QBO appends.
+    """
+    columns = report_json.get("Columns", {}).get("Column", [])
+    col_meta = []
+    for col in columns:
+        title = col.get("ColTitle", "")
+        m = re.match(r"([A-Za-z]{3})\s+(\d{4})", title)
+        if m:
+            col_meta.append((m.group(1), int(m.group(2))))
+        else:
+            col_meta.append(None)  # e.g. the account-name column or 'Total'
+
+    records = []
+
+    def extract_line(col_data, category, is_summary):
+        if not col_data:
+            return
+        name = col_data[0].get("value")
+        for i, cell in enumerate(col_data[1:], start=1):
+            if i >= len(col_meta) or col_meta[i] is None:
+                continue  # skip Total / unrecognized columns
+            month, year = col_meta[i]
+            try:
+                val = float(cell.get("value", 0) or 0)
+            except ValueError:
+                val = 0.0
+            records.append({
+                "Line_Item": name, "Category": category,
+                "Month": month, "Year": year, "Value": val,
+                "Is_Summary": is_summary,
+            })
+
+    def walk(rows_json, category="Unknown"):
+        if not rows_json or "Row" not in rows_json:
+            return
+        for row in rows_json["Row"]:
+            rtype = row.get("type")
+            if rtype == "Section":
+                group_name = row.get("Header", {}).get("ColData", [{}])[0].get("value", category)
+                walk(row.get("Rows", {}), category=group_name)
+                if "Summary" in row:
+                    extract_line(row["Summary"].get("ColData", []), group_name, True)
+            elif rtype == "Data":
+                extract_line(row.get("ColData", []), category, False)
+
+    walk(report_json.get("Rows", {}))
+    return pd.DataFrame(records)
+
+
+# ---------------------------------------------------------------------------
+# Forecast logic
+# ---------------------------------------------------------------------------
+def report_data_coverage(label: str, df: pd.DataFrame, expected_months: list) -> None:
+    """Prints how much of the expected month range actually has nonzero data.
+    Sandbox companies often only carry a handful of seeded months, which
+    silently breaks seasonal projection if you don't check for it."""
+    if df.empty:
+        print(f"  [{label}] No data returned at all.")
+        return
+    nonzero_months = sorted(
+        df[df["Value"] != 0]["Month"].unique().tolist(),
+        key=lambda m: MONTH_ORDER.index(m)
+    )
+    missing = [m for m in expected_months if m not in nonzero_months]
+    print(f"  [{label}] Nonzero data in: {nonzero_months or 'NONE'}"
+          f"{f' | Missing: {missing}' if missing else ''}")
+
+
+def build_seasonal_forecast(df_prior: pd.DataFrame, df_current: pd.DataFrame,
+                             last_actual_month: int, min_prior_months: int = 3) -> pd.DataFrame:
+    """
+    df_prior:   full 12 months of Line_Item/Month/Value for PRIOR_YEAR
+    df_current: Jan..last_actual_month of Line_Item/Month/Value for CURRENT_YEAR
+    Returns a combined long-format frame with Actual_Forecast and Method flags,
+    covering Jan-Dec of CURRENT_YEAR for every line item seen in either year.
+
+    Per line item, uses the seasonal method (prior-year month x YoY growth)
+    ONLY if the prior year has at least `min_prior_months` of nonzero data in
+    the future window. Otherwise falls back to a flat run-rate (average of
+    this year's actual months) so sparse test/sandbox data doesn't silently
+    collapse the forecast to zero. In a production company with real
+    multi-year history, most line items will qualify for the seasonal path.
+    """
+    actual_months = MONTH_ORDER[:last_actual_month]
+    future_months = MONTH_ORDER[last_actual_month:]
+
+    # YoY growth factor per line item, based on overlapping actual months
+    ytd_current = (df_current[df_current["Month"].isin(actual_months)]
+                   .groupby("Line_Item")["Value"].sum())
+    ytd_prior = (df_prior[df_prior["Month"].isin(actual_months)]
+                 .groupby("Line_Item")["Value"].sum())
+    growth = pd.DataFrame({"current": ytd_current, "prior": ytd_prior}).fillna(0.0)
+    growth["factor"] = np.where(growth["prior"] != 0, growth["current"] / growth["prior"], 1.0)
+    growth_map = growth["factor"].to_dict()
+
+    # Run-rate fallback: average of this year's actual monthly values
+    run_rate_map = (df_current[df_current["Month"].isin(actual_months)]
+                     .groupby("Line_Item")["Value"].mean().to_dict())
+
+    # How many nonzero future-window months does the prior year have, per line item?
+    prior_future_nonzero = df_prior[df_prior["Month"].isin(future_months) & (df_prior["Value"] != 0)]
+    coverage_map = prior_future_nonzero.groupby("Line_Item")["Month"].nunique().to_dict()
+
+    prior_future_lookup = (df_prior[df_prior["Month"].isin(future_months)]
+                            .set_index(["Line_Item", "Month"])["Value"].to_dict())
+
+    all_line_items = set(df_current["Line_Item"]).union(df_prior["Line_Item"])
+    categories = df_current[["Line_Item", "Category"]].drop_duplicates().set_index("Line_Item")["Category"].to_dict()
+    categories.update(df_prior[["Line_Item", "Category"]].drop_duplicates().set_index("Line_Item")["Category"].to_dict())
+
+    forecast_rows = []
+    fallback_count = 0
+    for line_item in all_line_items:
+        use_seasonal = coverage_map.get(line_item, 0) >= min_prior_months
+        if not use_seasonal:
+            fallback_count += 1
+        factor = growth_map.get(line_item, 1.0)
+        flat_val = run_rate_map.get(line_item, 0.0)
+        for month in future_months:
+            if use_seasonal:
+                value = prior_future_lookup.get((line_item, month), 0.0) * factor
+                method = "Seasonal"
+            else:
+                value = flat_val
+                method = "Run-Rate Fallback"
+            forecast_rows.append({
+                "Line_Item": line_item, "Category": categories.get(line_item, "Unknown"),
+                "Month": month, "Year": CURRENT_YEAR, "Value": value,
+                "Is_Summary": False, "Actual_Forecast": "Forecast", "Method": method,
+            })
+
+    if fallback_count:
+        print(f"  Note: {fallback_count} line item(s) had <{min_prior_months} months of prior-year "
+              f"future data, so they used a flat run-rate fallback instead of the seasonal method.")
+
+    actual_rows = df_current[df_current["Month"].isin(actual_months)].copy()
+    actual_rows["Actual_Forecast"] = "Actual"
+    actual_rows["Method"] = "Actual"
+
+    combined = pd.concat([actual_rows, pd.DataFrame(forecast_rows)], ignore_index=True, sort=False)
+    combined["Month"] = pd.Categorical(combined["Month"], categories=MONTH_ORDER, ordered=True)
+    return combined.sort_values(["Line_Item", "Month"])
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    try:
+        print(f"Forecasting {CURRENT_YEAR} through year-end, actuals confirmed through "
+              f"{MONTH_ORDER[LAST_ACTUAL_MONTH - 1]} {CURRENT_YEAR}...")
+
+        # --- Pull & parse P&L ---
+        pl_prior_json = fetch_monthly_report("ProfitAndLoss", f"{PRIOR_YEAR}-01-01", f"{PRIOR_YEAR}-12-31")
+        pl_current_json = fetch_monthly_report(
+            "ProfitAndLoss", f"{CURRENT_YEAR}-01-01",
+            f"{CURRENT_YEAR}-{LAST_ACTUAL_MONTH:02d}-28"
+        )
+        pl_prior = parse_monthly_report(pl_prior_json)
+        pl_current = parse_monthly_report(pl_current_json)
+
+        print("\nData coverage check (P&L):")
+        report_data_coverage(f"{PRIOR_YEAR} prior year", pl_prior, MONTH_ORDER)
+        report_data_coverage(f"{CURRENT_YEAR} current year", pl_current, MONTH_ORDER[:LAST_ACTUAL_MONTH])
+
+        pl_forecast = build_seasonal_forecast(pl_prior, pl_current, LAST_ACTUAL_MONTH)
+        print(f"P&L: {len(pl_forecast)} line-month records built.")
+
+        # --- Pull & parse Cash Flow ---
+        cf_prior_json = fetch_monthly_report("CashFlow", f"{PRIOR_YEAR}-01-01", f"{PRIOR_YEAR}-12-31")
+        cf_current_json = fetch_monthly_report(
+            "CashFlow", f"{CURRENT_YEAR}-01-01",
+            f"{CURRENT_YEAR}-{LAST_ACTUAL_MONTH:02d}-28"
+        )
+        cf_prior = parse_monthly_report(cf_prior_json)
+        cf_current = parse_monthly_report(cf_current_json)
+
+        print("\nData coverage check (Cash Flow):")
+        report_data_coverage(f"{PRIOR_YEAR} prior year", cf_prior, MONTH_ORDER)
+        report_data_coverage(f"{CURRENT_YEAR} current year", cf_current, MONTH_ORDER[:LAST_ACTUAL_MONTH])
+
+        cf_forecast = build_seasonal_forecast(cf_prior, cf_current, LAST_ACTUAL_MONTH)
+        print(f"Cash Flow: {len(cf_forecast)} line-month records built.")
+
+        # =================================================================
+        # VISUALIZATION: Key P&L metrics, Actual -> Forecast
+        # =================================================================
+        key_pl_metrics = ["Total Income", "Total Expenses", "Net Income"]
+        df_pl_plot = pl_forecast[pl_forecast["Line_Item"].isin(key_pl_metrics)]
+
+        fig_pl = go.Figure()
+        for metric in key_pl_metrics:
+            sub = df_pl_plot[df_pl_plot["Line_Item"] == metric].sort_values("Month")
+            actual_part = sub[sub["Actual_Forecast"] == "Actual"]
+            forecast_part = sub[sub["Actual_Forecast"] == "Forecast"]
+            # Bridge the gap so the dashed line connects to the solid one
+            bridge = pd.concat([actual_part.tail(1), forecast_part])
+
+            fig_pl.add_trace(go.Scatter(x=actual_part["Month"], y=actual_part["Value"],
+                                         mode="lines+markers", name=f"{metric} (Actual)",
+                                         legendgroup=metric))
+            fig_pl.add_trace(go.Scatter(x=bridge["Month"], y=bridge["Value"],
+                                         mode="lines+markers", name=f"{metric} (Forecast)",
+                                         line=dict(dash="dash"), legendgroup=metric))
+
+        fig_pl.update_layout(title=f"{CURRENT_YEAR} P&L: Actual + Seasonal Forecast",
+                              xaxis_title="Month", yaxis_title="Amount ($)",
+                              template="plotly_white")
+        fig_pl.update_xaxes(categoryorder="array", categoryarray=MONTH_ORDER)
+        fig_pl.show()
+
+        # =================================================================
+        # VISUALIZATION: Cash Flow key metrics, Actual -> Forecast
+        # =================================================================
+        # Common QBO CashFlow report line labels - adjust if your CoA differs
+        key_cf_metrics = [
+            "Net cash provided by operating activities",
+            "Net increase in cash",
+        ]
+        available_cf_metrics = [m for m in key_cf_metrics if m in cf_forecast["Line_Item"].unique()]
+
+        if available_cf_metrics:
+            df_cf_plot = cf_forecast[cf_forecast["Line_Item"].isin(available_cf_metrics)]
+            fig_cf = go.Figure()
+            for metric in available_cf_metrics:
+                sub = df_cf_plot[df_cf_plot["Line_Item"] == metric].sort_values("Month")
+                actual_part = sub[sub["Actual_Forecast"] == "Actual"]
+                forecast_part = sub[sub["Actual_Forecast"] == "Forecast"]
+                bridge = pd.concat([actual_part.tail(1), forecast_part])
+
+                fig_cf.add_trace(go.Scatter(x=actual_part["Month"], y=actual_part["Value"],
+                                             mode="lines+markers", name=f"{metric} (Actual)",
+                                             legendgroup=metric))
+                fig_cf.add_trace(go.Scatter(x=bridge["Month"], y=bridge["Value"],
+                                             mode="lines+markers", name=f"{metric} (Forecast)",
+                                             line=dict(dash="dash"), legendgroup=metric))
+
+            fig_cf.update_layout(title=f"{CURRENT_YEAR} Cash Flow: Actual + Seasonal Forecast",
+                                  xaxis_title="Month", yaxis_title="Amount ($)",
+                                  template="plotly_white")
+            fig_cf.update_xaxes(categoryorder="array", categoryarray=MONTH_ORDER)
+            fig_cf.show()
+        else:
+            print(f"None of {key_cf_metrics} found in Cash Flow report - "
+                  f"print(cf_forecast['Line_Item'].unique()) to see available labels "
+                  f"and update key_cf_metrics.")
+
+        # =================================================================
+        # SUMMARY TABLE: Full-year forecast vs prior year
+        # =================================================================
+        print("\n--- Full-Year Forecast Summary (P&L) ---")
+        fy_summary = (pl_forecast[pl_forecast["Line_Item"].isin(key_pl_metrics)]
+                      .groupby("Line_Item")["Value"].sum()
+                      .rename(f"FY{CURRENT_YEAR} Forecast").reset_index())
+        fy_prior = (pl_prior[pl_prior["Line_Item"].isin(key_pl_metrics)]
+                    .groupby("Line_Item")["Value"].sum()
+                    .rename(f"FY{PRIOR_YEAR} Actual"))
+        fy_summary = fy_summary.merge(fy_prior, on="Line_Item", how="left")
+        fy_summary["YoY_Change_%"] = (
+            (fy_summary[f"FY{CURRENT_YEAR} Forecast"] - fy_summary[f"FY{PRIOR_YEAR} Actual"])
+            / fy_summary[f"FY{PRIOR_YEAR} Actual"] * 100
+        )
+        print(fy_summary.to_string(index=False))
+
+    except requests.exceptions.HTTPError as http_err:
+        print(f"\nHTTP error occurred during operation: {http_err}")
+    except Exception as err:
+        print(f"\nAn unexpected runtime error occurred: {err}")
