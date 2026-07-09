@@ -57,4 +57,4 @@ The script prints a data-coverage summary for both years (so you can see up fron
 
 - Requires at least some prior-year transaction history in QuickBooks to forecast meaningfully; sparse sandbox/test companies will lean heavily on the run-rate fallback.
 - Cash Flow line-item labels (`Net cash provided by operating activities`, etc.) follow QuickBooks' standard report labels — if your chart of accounts produces different labels, update `key_cf_metrics` in the script.
-- Demoed here against a QuickBooks Online **sandbox** company, not a live production ledger.
+- Demoed here against a QuickBooks Online **sandbox** company, not an actual live, client account.
