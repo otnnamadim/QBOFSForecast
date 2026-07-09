@@ -293,6 +293,35 @@ try:
     st.plotly_chart(fig_pl, use_container_width=True)
 
     # -----------------------------------------------------------------
+    # Prior year vs current year trend comparison (real data, not illustrative)
+    # -----------------------------------------------------------------
+    st.subheader(f"{prior_year} Baseline vs {current_year} (Actual + Forecast)")
+    st.caption(
+        f"Shows {prior_year}'s real monthly Total Income directly against {current_year}'s "
+        f"combined actual-through-{MONTH_ORDER[last_actual_month - 1]} plus forecasted remainder - "
+        f"this is the actual growth factor your data produces, not an assumption."
+    )
+    comparison_metric = st.selectbox(
+        "Metric", ["Total Income", "Total Expenses", "Net Income"], index=0, key="trend_compare_metric"
+    )
+    prior_line = (pl_prior[pl_prior["Line_Item"] == comparison_metric]
+                  .set_index("Month")["Value"].reindex(MONTH_ORDER))
+    current_line = (pl_forecast[pl_forecast["Line_Item"] == comparison_metric]
+                     .set_index("Month")["Value"].reindex(MONTH_ORDER))
+
+    fig_trend = go.Figure()
+    fig_trend.add_trace(go.Scatter(x=MONTH_ORDER, y=prior_line.values, mode="lines+markers",
+                                    name=f"{prior_year}", line=dict(color="#1f77b4", width=2)))
+    fig_trend.add_trace(go.Scatter(x=MONTH_ORDER, y=current_line.values, mode="lines+markers",
+                                    name=f"{current_year}", line=dict(color="#d62728", width=2)))
+    fig_trend.update_layout(
+        title=f"{comparison_metric}: {prior_year} vs {current_year}",
+        xaxis_title="Month", yaxis_title="Amount ($)", template="plotly_white",
+    )
+    fig_trend.update_xaxes(categoryorder="array", categoryarray=MONTH_ORDER)
+    st.plotly_chart(fig_trend, use_container_width=True)
+
+    # -----------------------------------------------------------------
     # Cash Flow chart
     # -----------------------------------------------------------------
     st.subheader("Cash Flow Forecast")
