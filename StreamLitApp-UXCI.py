@@ -18,15 +18,18 @@ Run locally with:  streamlit run app.py
 
 import os
 import re
+import json
+import time
+import calendar
 from pathlib import Path
 from datetime import date
-
 import numpy as np
 import pandas as pd
 import requests
 from requests.auth import HTTPBasicAuth
 import plotly.graph_objects as go
 import streamlit as st
+
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -40,14 +43,20 @@ MONTH_ORDER = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "O
 # ---------------------------------------------------------------------------
 # Credentials: st.secrets first, .env fallback for local dev
 # ---------------------------------------------------------------------------
+from streamlit.errors import StreamlitSecretNotFoundError
+
 def load_credentials() -> dict:
-    if "qbo" in st.secrets:
-        return {
-            "client_id": st.secrets["qbo"]["client_id"],
-            "client_secret": st.secrets["qbo"]["client_secret"],
-            "refresh_token": st.secrets["qbo"]["refresh_token"],
-            "realm_id": st.secrets["qbo"]["realm_id"],
-        }
+    try:
+        if "qbo" in st.secrets:
+            return {
+                "client_id": st.secrets["qbo"]["client_id"],
+                "client_secret": st.secrets["qbo"]["client_secret"],
+                "refresh_token": st.secrets["qbo"]["refresh_token"],
+                "realm_id": st.secrets["qbo"]["realm_id"],
+            }
+    except StreamlitSecretNotFoundError:
+        pass   # no secrets.toml at all -> fall through to .env
+
     from dotenv import load_dotenv
     env_path = Path(__file__).parent / "API_Keys.env"
     load_dotenv(env_path, override=True)
@@ -58,26 +67,63 @@ def load_credentials() -> dict:
         "realm_id": os.getenv("Realm_ID"),
     }
     if not all(creds.values()):
-        st.error(
-            "No QBO credentials found. Set them in .streamlit/secrets.toml "
-            "(deployed) or API_Keys.env (local)."
-        )
+        st.error("No QBO credentials found. Set them in .streamlit/secrets.toml "
+                 "(deployed) or API_Keys.env (local).")
         st.stop()
     return creds
 
 
 CREDS = load_credentials()
 
+# ---------------------------------------------------------------------------
+# Token store: persists the rotating token pair. Secrets only seed first run.
 
-@st.cache_data(ttl=3000, show_spinner=False)
-def get_access_token() -> str:
-    url = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
-    headers = {"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"}
-    payload = {"grant_type": "refresh_token", "refresh_token": CREDS["refresh_token"]}
-    response = requests.post(url, headers=headers, data=payload,
-                              auth=HTTPBasicAuth(CREDS["client_id"], CREDS["client_secret"]))
-    response.raise_for_status()
-    return response.json()["access_token"]
+TOKEN_FILE = Path(__file__).parent / ".qbo_tokens.json"   # add to .gitignore!
+
+def _load_tokens() -> dict:
+    if TOKEN_FILE.exists():
+        return json.loads(TOKEN_FILE.read_text())
+    # First run: seed from secrets/.env
+    return {"access_token": None,
+            "refresh_token": CREDS["refresh_token"],
+            "expires_at": 0}
+
+def _save_tokens(tokens: dict) -> None:
+    TOKEN_FILE.write_text(json.dumps(tokens))
+
+def get_access_token(force_refresh: bool = False) -> str:
+    tokens = _load_tokens()
+
+    # Reuse the current access token if it has >60s of life left
+    if (not force_refresh and tokens.get("access_token")
+            and time.time() < tokens.get("expires_at", 0) - 60):
+        return tokens["access_token"]
+
+    resp = requests.post(
+        "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
+        headers={"Accept": "application/json",
+                 "Content-Type": "application/x-www-form-urlencoded"},
+        data={"grant_type": "refresh_token",
+              "refresh_token": tokens["refresh_token"]},
+        auth=HTTPBasicAuth(CREDS["client_id"], CREDS["client_secret"]),
+    )
+
+    if resp.status_code == 400 and "invalid_grant" in resp.text:
+        st.error("The QuickBooks connection has expired and needs to be "
+                 "re-authorized. Generate a new refresh token and update "
+                 "the stored credentials.")
+        st.stop()
+    resp.raise_for_status()
+
+    new = resp.json()
+    tokens.update(
+        access_token=new["access_token"],
+        # THE critical line: keep the rotated refresh token
+        refresh_token=new.get("refresh_token", tokens["refresh_token"]),
+        expires_at=time.time() + new.get("expires_in", 3600),
+    )
+    _save_tokens(tokens)
+    return tokens["access_token"]
 
 
 # ---------------------------------------------------------------------------
@@ -85,17 +131,21 @@ def get_access_token() -> str:
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_monthly_report(report_name: str, start_date: str, end_date: str) -> dict:
-    token = get_access_token()
     url = f"{BASE_URL}/v3/company/{CREDS['realm_id']}/reports/{report_name}"
-    params = {
-        "start_date": start_date, "end_date": end_date,
-        "accounting_method": "Accrual", "summarize_column_by": "Month", "minorversion": "75",
-    }
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    response = requests.get(url, headers=headers, params=params)
+    params = {"start_date": start_date, "end_date": end_date,
+              "accounting_method": "Accrual", "summarize_column_by": "Month",
+              "minorversion": "75"}
+
+    def _call(token):
+        return requests.get(url, params=params,
+                            headers={"Authorization": f"Bearer {token}",
+                                     "Accept": "application/json"})
+
+    response = _call(get_access_token())
+    if response.status_code == 401:                      # token died mid-flight
+        response = _call(get_access_token(force_refresh=True))  # refresh, retry once
     response.raise_for_status()
     return response.json()
-
 
 def parse_monthly_report(report_json: dict) -> pd.DataFrame:
     columns = report_json.get("Columns", {}).get("Column", [])
@@ -227,6 +277,7 @@ today = date.today()
 default_last_month = (today.month - 1) if today.year == current_year and today.month > 1 else 12
 last_actual_month = st.sidebar.slider("Last closed month (actuals confirmed through)", 1, 12,
                                        value=default_last_month)
+last_day = calendar.monthrange(current_year, last_actual_month)[1]
 min_prior_months = st.sidebar.slider(
     "Min. prior-year months required for seasonal method", 1, 6, value=3,
     help="Line items with fewer nonzero prior-year months in the forecast window "
@@ -247,10 +298,10 @@ try:
     with st.spinner("Pulling P&L and Cash Flow data from QuickBooks..."):
         pl_prior = parse_monthly_report(fetch_monthly_report("ProfitAndLoss", f"{prior_year}-01-01", f"{prior_year}-12-31"))
         pl_current = parse_monthly_report(fetch_monthly_report(
-            "ProfitAndLoss", f"{current_year}-01-01", f"{current_year}-{last_actual_month:02d}-28"))
+            "ProfitAndLoss", f"{current_year}-01-01", f"{current_year}-{last_actual_month:02d}-{last_day:02d}"))
         cf_prior = parse_monthly_report(fetch_monthly_report("CashFlow", f"{prior_year}-01-01", f"{prior_year}-12-31"))
         cf_current = parse_monthly_report(fetch_monthly_report(
-            "CashFlow", f"{current_year}-01-01", f"{current_year}-{last_actual_month:02d}-28"))
+            "CashFlow", f"{current_year}-01-01", f"{current_year}-{last_actual_month:02d}-{last_day:02d}"))
 
     pl_forecast, pl_fallback_items = build_seasonal_forecast(
         pl_prior, pl_current, last_actual_month, current_year, min_prior_months)
