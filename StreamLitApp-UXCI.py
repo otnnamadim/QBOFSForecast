@@ -39,6 +39,18 @@ st.set_page_config(page_title="QBO Seasonal Forecast", page_icon="📈", layout=
 BASE_URL = "https://sandbox-quickbooks.api.intuit.com"  # swap to quickbooks.api.intuit.com for production
 MONTH_ORDER = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
+DISCOVERY_URL = "https://developer.api.intuit.com/.well-known/openid_configuration"
+FALLBACK_TOKEN_ENDPOINT = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
+
+@st.cache_data(ttl=86400, show_spinner=False)  # re-fetch once a day
+def get_token_endpoint() -> str:
+    try:
+        resp = requests.get(DISCOVERY_URL, timeout=(5, 15))
+        resp.raise_for_status()
+        return resp.json()["token_endpoint"]
+    except Exception:
+        # Discovery outage shouldn't take down token refresh
+        return FALLBACK_TOKEN_ENDPOINT
 
 # ---------------------------------------------------------------------------
 # Credentials: st.secrets first, .env fallback for local dev
@@ -100,7 +112,7 @@ def get_access_token(force_refresh: bool = False) -> str:
         return tokens["access_token"]
 
     resp = requests.post(
-        "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
+        get_token_endpoint(),
         headers={"Accept": "application/json",
                  "Content-Type": "application/x-www-form-urlencoded"},
         data={"grant_type": "refresh_token",
