@@ -531,7 +531,8 @@ except Exception:
 # Support footer (always visible)
 # ---------------------------------------------------------------------------
 st.markdown("---")
-st.caption(f"Questions or issues? Contact {SUPPORT_EMAIL}")                "client_id": st.secrets["qbo"]["client_id"],
+st.caption(f"Questions or issues? Contact {SUPPORT_EMAIL}")                
+                "client_id": st.secrets["qbo"]["client_id"],
                 "client_secret": st.secrets["qbo"]["client_secret"],
                 "refresh_token": st.secrets["qbo"]["refresh_token"],
                 "realm_id": st.secrets["qbo"]["realm_id"],
