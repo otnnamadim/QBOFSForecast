@@ -1,4 +1,4 @@
-# QBOFSForecast
+# QBO Financial Statement Forecast
 
 Many Small Business Owners utilize QuickBooks Online as an accounting solution for their financial and tax reporting. The basic subscription does not include an embedded forecasting tool which is a common expectation of small business owners who require assistance with interpretting their financial statements. This program utilizes the QuickBooks Accounting API to forecast a year-end Income Statement (P & L) and statement of cash flow using the **seasonal naive + growth** method — a simple, explainable approach suited for CFO-style reporting rather than a statistical/ML model.
 
